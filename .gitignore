@@ -1,6 +1,8 @@
 .DS_Store
 .idea/*
 
+*output_cdfi*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
