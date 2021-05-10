@@ -1,201 +1,86 @@
-import os
-import shutil
-import datetime
-import argparse
-
-import torch
-import numpy as np
+from datareader import DBreader_Vimeo90k, BVIDVC, Sampler
 from torch.utils.data import DataLoader
-
-import utility
+import argparse
+from torchvision import transforms
+import torch
+from TestModule import Middlebury_other
+from trainer import Trainer
 from loss import Loss
-from datasets import Vimeo90K_interp
-from test import Middlebury_other
+import datetime
+from os.path import join
 from models.cdfi_adacof import CDFI_adacof
 
+parser = argparse.ArgumentParser(description='AdaCoF-Pytorch')
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Compression-Driven Frame Interpolation Training')
+# parameters
+# Hardware Setting
+parser.add_argument('--gpu_id', type=int, default=0)
 
-    # parameters
-    # Model Selection
-    parser.add_argument('--model', type=str, default='cdfi_adacof')
+# Directory Setting
+parser.add_argument('--data_dir', type=str, default='D:\\')
+parser.add_argument('--out_dir', type=str, default='./output_cdfi_train')
+parser.add_argument('--load', type=str, default=None)
+parser.add_argument('--test_input', type=str, default='./test_input/middlebury_others/input')
+parser.add_argument('--gt', type=str, default='./test_input/middlebury_others/gt')
 
-    # Hardware Setting
-    parser.add_argument('--gpu_id', type=int, default=0)
-    parser.add_argument('--use_cudnn', type=bool, default=True)
+# Learning Options
+parser.add_argument('--epochs', type=int, default=100, help='Max Epochs')
+parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+parser.add_argument('--patch_size', type=int, default=224, help='Patch size')
 
-    # Directory Setting
-    parser.add_argument('--data_dir', type=str, default='./vimeo_triplet/')
-    parser.add_argument('--uid', type=str, default=None)
-    parser.add_argument('--force', action='store_true', help='force to override the given uid')
-    parser.add_argument('--test_input', type=str, default='./test_data/middlebury_others/input')
-    parser.add_argument('--test_gt', type=str, default='./test_data/middlebury_others/gt')
+# Optimization specifications
+parser.add_argument('--loss', type=str, default='1*Charb+0.01*g_Spatial')
+parser.add_argument('--lr', type=float, default=1e-3)
+parser.add_argument('--lr_decay', type=int, default=20, help='learning rate decay per N epochs')
+parser.add_argument('--decay_type', type=str, default='step', help='learning rate decay type')
+parser.add_argument('--gamma', type=float, default=0.5, help='learning rate decay factor for step decay')
+parser.add_argument('--optimizer', default='ADAMax', choices=('SGD', 'ADAM', 'RMSprop', 'ADAMax'), help='optimizer to use (SGD | ADAM | RMSprop | ADAMax)')
+parser.add_argument('--weight_decay', type=float, default=0, help='weight decay')
 
-    # Learning Options
-    parser.add_argument('--epochs', type=int, default=100, help='Max Epochs')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
-    parser.add_argument('--loss', type=str, default='1*Charb+0.01*g_Spatial+0.005*VGG', help='loss function configuration')
+# Model
+parser.add_argument('--kernel_size', type=int, default=11)
+parser.add_argument('--dilation', type=int, default=2)
 
-    # Optimization specifications
-    parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
-    parser.add_argument('--lr_decay', type=int, default=20, help='learning rate decay per N epochs')
-    parser.add_argument('--decay_type', type=str, default='step', help='learning rate decay type')
-    parser.add_argument('--gamma', type=float, default=0.5, help='learning rate decay factor for step decay')
-    parser.add_argument('--optimizer', default='ADAMax', choices=('SGD', 'ADAM', 'RMSprop', 'ADAMax'), help='optimizer to use (SGD | ADAM | RMSprop | ADAMax)')
-    parser.add_argument('--weight_decay', type=float, default=0, help='weight decay')
-
-    # Options for AdaCoF
-    parser.add_argument('--kernel_size', type=int, default=11)
-    parser.add_argument('--dilation', type=int, default=2)
-
-    args = parser.parse_args()
-
-    if args.uid is None:
-        unique_id = str(np.random.randint(0, 100000))
-        print("revise the unique id to a random number " + str(unique_id))
-        args.uid = unique_id
-        timestamp = datetime.datetime.now().strftime("%a-%b-%d-%H-%M")
-        save_path = './model_weights/' + args.uid + '-' + timestamp
-    else:
-        save_path = './model_weights/' + str(args.uid)
-
-    if not os.path.exists(save_path + "/best" + ".pth"):
-        os.makedirs(save_path, exist_ok=True)
-    else:
-        if not args.force:
-            raise ("please use another uid ")
-        else:
-            print("override this uid" + args.uid)
-            for m in range(1, 10):
-                if not os.path.exists(save_path + "/log.txt.bk" + str(m)):
-                    shutil.copy(save_path + "/log.txt", save_path + "/log.txt.bk" + str(m))
-                    shutil.copy(save_path + "/args.txt", save_path + "/args.txt.bk" + str(m))
-                    break
-
-    parser.add_argument('--save_path', default=save_path, help='the output dir of weights')
-    parser.add_argument('--log', default=save_path + '/log.txt', help='the log file in training')
-    parser.add_argument('--arg', default=save_path + '/args.txt', help='the args used')
-
-    args = parser.parse_args()
-
-    with open(args.log, 'w') as f:
-        f.close()
-    with open(args.arg, 'w') as f:
-        print(args)
-        print(args, file=f)
-        f.close()
-    if args.use_cudnn:
-        print("cudnn is used")
-        torch.backends.cudnn.benchmark = True
-    else:
-        print("cudnn is not used")
-        torch.backends.cudnn.benchmark = False
-
-    return args
-
-
-class Trainer:
-    def __init__(self, args, train_loader, test_loader, my_model, my_loss, start_epoch=1):
-        self.args = args
-        self.train_loader = train_loader
-        self.max_step = self.train_loader.__len__()
-        self.test_loader = test_loader
-        self.model = my_model
-        self.loss = my_loss
-        self.current_epoch = start_epoch
-        self.save_path = args.save_path
-
-        self.optimizer = utility.make_optimizer(args, self.model)
-        self.scheduler = utility.make_scheduler(args, self.optimizer)
-
-        if not os.path.exists(args.save_path):
-            os.makedirs(args.save_path)
-        self.result_dir = args.save_path + '/results'
-        self.ckpt_dir = args.save_path + '/checkpoints'
-
-        if not os.path.exists(self.result_dir):
-            os.makedirs(self.result_dir)
-        if not os.path.exists(self.ckpt_dir):
-            os.makedirs(self.ckpt_dir)
-
-        self.logfile = open(args.log, 'w')
-
-        # Initial Test
-        self.model.eval()
-        self.best_psnr = self.test_loader.test(self.model, self.result_dir,
-                                               output_name=str(self.current_epoch).zfill(3), file_stream=self.logfile)
-
-    def train(self):
-        # Train
-        self.model.train()
-        for batch_idx, (frame0, frame1, frame2) in enumerate(self.train_loader):
-            frame0 = frame0.cuda()
-            frame1 = frame1.cuda()
-            frame2 = frame2.cuda()
-
-            self.optimizer.zero_grad()
-
-            output = self.model(frame0, frame2)
-            loss = self.loss(output, frame1)
-            loss.backward()
-            self.optimizer.step()
-
-            if batch_idx % 100 == 0:
-                torch.save({'epoch': self.current_epoch, 'state_dict': self.model.state_dict()},
-                           self.ckpt_dir + "/real_time.pth")
-                utility.print_and_save('{:<13s}{:<14s}{:<6s}{:<16s}{:<12s}{:<20.16f}'.format('Train Epoch: ', '[' + str(
-                    self.current_epoch) + '/' + str(self.args.epochs) + ']', 'Step: ', '[' + str(batch_idx) + '/' + str(
-                    self.max_step) + ']', 'train loss: ', loss.item()), self.logfile)
-
-        self.current_epoch += 1
-        self.scheduler.step()
-        utility.print_and_save('===== current lr: %f =====' % (self.optimizer.param_groups[0]['lr']), self.logfile)
-
-    def test(self):
-        utility.print_and_save('Testing...', self.logfile)
-        # Test
-        self.model.eval()
-        tmp_psnr = self.test_loader.test(self.model, self.result_dir, output_name=str(self.current_epoch).zfill(3),
-                                         file_stream=self.logfile)
-        if tmp_psnr > self.best_psnr:
-            self.best_psnr = tmp_psnr
-            torch.save({'epoch': self.current_epoch, 'state_dict': self.model.state_dict()},
-                       self.ckpt_dir + '/model_epoch_' + str(self.current_epoch).zfill(3) + '.pth')
-
-    def terminate(self):
-        return self.current_epoch >= self.args.epochs
-
-    def close(self):
-        self.logfile.close()
-
+transform = transforms.Compose([transforms.ToTensor()])
 
 def main():
-    args = parse_args()
+    args = parser.parse_args()
     torch.cuda.set_device(args.gpu_id)
 
-    # prepare training data
-    train_dataset, val_dataset = Vimeo90K_interp(args.data_dir)
-    train_loader = DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8)
-    # val_loader = DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8)
+    vimeo90k_train = DBreader_Vimeo90k(join(args.data_dir, 'vimeo_triplet'), random_crop=(args.patch_size, args.patch_size))
+    bvidvc_2k = BVIDVC(join(args.data_dir, 'bvidvc'), res='2k', crop_sz=(args.patch_size,args.patch_size))
+    bvidvc_1080 = BVIDVC(join(args.data_dir, 'bvidvc'), res='1080', crop_sz=(args.patch_size,args.patch_size))
+    bvidvc_960 = BVIDVC(join(args.data_dir, 'bvidvc'), res='960', crop_sz=(args.patch_size,args.patch_size))
+    bvidvc_480 = BVIDVC(join(args.data_dir, 'bvidvc'), res='480', crop_sz=(args.patch_size,args.patch_size))
+    datasets_train = [vimeo90k_train] + 64*[bvidvc_2k] + 16*[bvidvc_1080] + 4*[bvidvc_960, bvidvc_480] 
+    train_sampler = Sampler(datasets_train, iter=True)
 
-    # prepare test data
-    test_db = Middlebury_other(args.test_input, args.test_gt)
-
-    # initialize our model
+    TestDB = Middlebury_other(args.test_input, args.gt)
+    train_loader = DataLoader(dataset=train_sampler, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    
     model = CDFI_adacof(args).cuda()
-    print("# of model parameters is: " + str(utility.count_network_parameters(model)))
-
-    # prepare the loss
+    
     loss = Loss(args)
 
-    # prepare the trainer
-    my_trainer = Trainer(args, train_loader, test_db, model, loss)
+    start_epoch = 0
+    if args.load is not None:
+        checkpoint = torch.load(args.load)
+        model.load_state_dict(checkpoint['state_dict'])
+        start_epoch = checkpoint['epoch']
 
-    # start training
+    my_trainer = Trainer(args, train_loader, TestDB, model, loss, start_epoch)
+
+    now = datetime.datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
+    with open(args.out_dir + '/config.txt', 'a') as f:
+        f.write(now + '\n\n')
+        for arg in vars(args):
+            f.write('{}: {}\n'.format(arg, getattr(args, arg)))
+        f.write('\n')
+
     while not my_trainer.terminate():
         my_trainer.train()
-        my_trainer.test()
+        if my_trainer.current_epoch % 10 == 0:
+            my_trainer.test()
 
     my_trainer.close()
 
